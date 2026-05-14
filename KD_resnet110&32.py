@@ -4,13 +4,27 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-import dataset
-from models import ResNet20, ResNet56
+from dataset import *
+from models.ResNet import ResNet110, ResNet32
+from pathlib import Path
+
+def _attention_map(feat):
+    # Attention transfer: sum of squared activations over channels.
+    att = feat.pow(2).mean(dim=1, keepdim=True)
+    return F.normalize(att.flatten(1), p=2, dim=1)
+
+
+def _feature_distill_loss(student_feat, teacher_feat):
+    teacher_feat = teacher_feat.detach()
+    if student_feat.shape[-2:] != teacher_feat.shape[-2:]:
+        student_feat = F.adaptive_avg_pool2d(student_feat, teacher_feat.shape[-2:])
+    return F.mse_loss(_attention_map(student_feat), _attention_map(teacher_feat))
 
 
 def distill_loss(student_logits, teacher_logits, student_feat, teacher_feat, labels, alpha, beta, base_t):
+    """ 自适应温度 + 中间层匹配"""
     ce_loss = F.cross_entropy(student_logits, labels)
-
+    
     with torch.no_grad():
         teacher_probs = F.softmax(teacher_logits, dim=1)
         entropy = -(teacher_probs * torch.log(teacher_probs + 1e-8)).sum(dim=1)
@@ -23,9 +37,26 @@ def distill_loss(student_logits, teacher_logits, student_feat, teacher_feat, lab
     kd_loss = F.kl_div(student_log_T, teacher_soft_T, reduction='none').sum(dim=1)
     kd_loss = (kd_loss * (temperature.squeeze(1) ** 2)).mean()
 
-    feat_loss = F.mse_loss(student_feat, teacher_feat.detach())
+    feat_loss = _feature_distill_loss(student_feat, teacher_feat)
     return (1.0 - alpha) * ce_loss + alpha * kd_loss + beta * feat_loss
 
+def dis_loss(student_logits, teacher_logits,labels,alpha,base_t):
+    """ 普通蒸馏"""
+    ce_loss =  F.cross_entropy(student_logits, labels)
+    
+    with torch.no_grad():
+        temperature = torch.full(
+            (student_logits.size(0), 1),
+            fill_value=base_t,
+            device=student_logits.device,
+            dtype=student_logits.dtype
+        )
+    student_log_T = F.log_softmax(student_logits / temperature, dim=1)
+    teacher_soft_T = F.softmax(teacher_logits / temperature, dim=1)  
+    kd_loss = F.kl_div(student_log_T, teacher_soft_T, reduction='none').sum(dim=1)
+    kd_loss = (kd_loss * (temperature.squeeze(1) ** 2)).mean()
+
+    return (1.0 - alpha) * ce_loss + alpha * kd_loss
 
 def load_teacher(model, ckpt_path, device):
     try:
@@ -45,7 +76,7 @@ def load_teacher(model, ckpt_path, device):
     model.load_state_dict(state_dict)
 
 
-def train(epoch, student, teacher, trainloader, optimizer, device, alpha, beta, base_t, epochs):
+def train(epoch, student, teacher, trainloader, optimizer, device, alpha, beta, base_t, epochs,normal_KD):
     student.train()
     teacher.eval()
 
@@ -61,7 +92,11 @@ def train(epoch, student, teacher, trainloader, optimizer, device, alpha, beta, 
 
         optimizer.zero_grad()
         student_logits, student_feat = student(inputs, return_features=True, feature_layer='layer2')
-        loss = distill_loss(student_logits, teacher_logits, student_feat, teacher_feat, targets, alpha, beta, base_t)
+        if normal_KD:
+            loss = dis_loss(student_logits, teacher_logits, targets, alpha, base_t)
+            
+        else:
+            loss = distill_loss(student_logits, teacher_logits, student_feat, teacher_feat, targets, alpha, beta, base_t)
         loss.backward() #损失反向传播
         optimizer.step()
 
@@ -80,38 +115,25 @@ def train(epoch, student, teacher, trainloader, optimizer, device, alpha, beta, 
     # )
 
 
-def test(epoch, student, testloader, device, best_acc, save_name):
+def evaluate(student, dataloader, device):
     student.eval()
-    test_loss = 0.0
+    eval_loss = 0.0
     correct = 0
     total = 0
 
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(testloader):
+        for batch_idx, (inputs, targets) in enumerate(dataloader):
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = student(inputs)
             loss = F.cross_entropy(outputs, targets)
 
-            test_loss += loss.item()
+            eval_loss += loss.item()
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-            
 
     acc = 100.0 * correct / total
-    print(f"==> Test Loss: {test_loss / len(testloader):.4f} | Test Acc: {acc:.2f}%")
-
-    if acc > best_acc:
-        print(f"==> Saving model: {best_acc:.2f}% -> {acc:.2f}%")
-        model_to_save = student.module if hasattr(student, 'module') else student
-        os.makedirs('checkpoint', exist_ok=True)
-        torch.save(
-            {'net': model_to_save.state_dict(), 'acc': acc, 'epoch': epoch},
-            os.path.join('checkpoint', save_name)
-        )
-        best_acc = acc
-
-    return best_acc
+    return eval_loss / len(dataloader), acc
 
 
 def main():
@@ -121,31 +143,30 @@ def main():
     project_dir = os.path.dirname(os.path.abspath(__file__))
     data_root = r'E:\Python\datasets\CIFAR-100'
    # teacher_ckpt = os.path.join(project_dir, 'checkpoint', 'teacher_resnet56_best.pth')
-    teacher_ckpt = os.path.join(
-    r"E:\paper\feature\checkpoint",
-    "teacher_resnet56_best.pth"
-    )
+    teacher_ckpt = Path(__file__).resolve().parent / 'checkpoint' / 'Ter_resnet110-best.pth'
     print(f"Teacher checkpoint path: {teacher_ckpt}")
-    student_ckpt = 'student_resnet20_adaptive_layer2.pth'
+    student_ckpt = Path(__file__).resolve().parent / 'checkpoint' / 'student_resnet32_adaptive_layer2.pth'
 
     batch_size = 128
     epochs = 300
     lr = 0.1
-    alpha = 0.9
+    alpha = 0.1
     beta = 0.3
     base_t = 4.0
-
+    normal_KD  = False
     print('==> Preparing CIFAR100 data..')
-    trainloader, testloader = dataset.get_loader(
+    trainloader, valloader, testloader = CIFAR100.get_loader(
         root=data_root,
         batch_size=batch_size,
         test_batch_size=100,
+        val_ratio=0.1,
+        seed=42,
         num_workers=2
     )
 
     print('==> Building teacher and student..')
-    teacher = ResNet56(dataset='cifar100', num_classes=100).to(device)
-    student = ResNet20(dataset='cifar100', num_classes=100).to(device)
+    teacher = ResNet110(dataset='cifar100', num_classes=100).to(device)
+    student = ResNet32(dataset='cifar100', num_classes=100).to(device)
 
     if torch.cuda.is_available():
         teacher = torch.nn.DataParallel(teacher)
@@ -164,11 +185,28 @@ def main():
 
     best_acc = 0.0
     for epoch in range(1, epochs + 1):
-        train(epoch, student, teacher, trainloader, optimizer, device, alpha, beta, base_t, epochs)
-        best_acc = test(epoch, student, testloader, device, best_acc, student_ckpt)
+        train(epoch, student, teacher, trainloader, optimizer, device, alpha, beta, base_t, epochs,normal_KD=False)
+        val_loss, val_acc = evaluate(student, valloader, device)
+        print(f"==> Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
+        if val_acc > best_acc:
+            print(f"==> Saving model: {best_acc:.2f}% -> {val_acc:.2f}%")
+            model_to_save = student.module if hasattr(student, 'module') else student
+            os.makedirs('checkpoint', exist_ok=True)
+            torch.save(
+                {'net': model_to_save.state_dict(), 'acc': val_acc, 'epoch': epoch},
+                student_ckpt
+            )
+            best_acc = val_acc
         scheduler.step()
 
-    print(f'Training finished. Best Acc: {best_acc:.2f}%')
+    best_model_path =  student_ckpt
+    checkpoint = torch.load(best_model_path, map_location=device)
+    model_to_load = student.module if hasattr(student, 'module') else student
+    model_to_load.load_state_dict(checkpoint['net'])
+    test_loss, test_acc = evaluate(student, testloader, device)
+
+    print(f'Training finished. Best Val Acc: {best_acc:.2f}%')
+    print(f'Final Test Loss: {test_loss:.4f} | Final Test Acc: {test_acc:.2f}%')
 
 
 if __name__ == '__main__':

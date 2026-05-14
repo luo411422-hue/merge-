@@ -84,7 +84,7 @@ class Bottleneck(nn.Module):
 
 
 class ResNet(nn.Module):
-    def __init__(self, dataset='cifar10', depth=18, num_classes=10, bottleneck=False):
+    def __init__(self, dataset='cifar100', depth=18, num_classes=10, bottleneck=False):
         super(ResNet, self).__init__()
         self.dataset = dataset
         if self.dataset.startswith('cifar'):
@@ -190,17 +190,30 @@ class ResNet(nn.Module):
             return x, features.get(feature_layer)
         return x
 
+def ResNet18(**kwargs):
+    return ResNet(depth=18,**kwargs)
+
 def ResNet20(**kwargs):
     return ResNet(depth=20,**kwargs)
 
 def ResNet34(**kwargs):
     return ResNet(depth=34,**kwargs)
 
+def ResNet32(**kwargs):
+    return ResNet(depth=32,**kwargs)
+
+def ResNet50(**kwargs):
+    return ResNet(depth=50,**kwargs)
+    
 def ResNet56(**kwargs):
     return ResNet(depth=56,**kwargs)
 
+    
 def ResNet101(**kwargs):
     return ResNet(depth=101,**kwargs)
+    
+def ResNet110(**kwargs):
+    return ResNet(depth=110,**kwargs)
 
 def ResNet152(**kwargs):
     return ResNet(depth=152,**kwargs)
@@ -209,7 +222,7 @@ def ResNet200(**kwargs):
     return ResNet(depth=200,**kwargs)
 
 if __name__ == '__main__':
-    net = ResNet56(dataset='imagenet',num_classes=1000)
+    net = ResNet50(dataset='imagenet',num_classes=1000)
     y = net(torch.randn(1, 3, 224, 224))
     # print(net)
     print(y.size())
